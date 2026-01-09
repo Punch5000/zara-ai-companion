@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Chat with Zara</title>
+  <style>
+    body { font-family: Arial; max-width: 600px; margin: 40px auto; }
+    #chat { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; }
+    input { width: 80%; padding: 10px; }
+    button { padding: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Chat with Zara</h2>
+  <div id="chat"></div>
+  <input id="msg" placeholder="Speak to Zara..." />
+  <button onclick="send()">Send</button>
+
+  <script>
+    async function send() {
+      const input = document.getElementById("msg");
+      const chat = document.getElementById("chat");
+      const text = input.value;
+      if (!text) return;
+
+      chat.innerHTML += `<p><b>You:</b> ${text}</p>`;
+      input.value = "";
+
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text })
+      });
+
+      const data = await res.json();
+      chat.innerHTML += `<p><b>Zara:</b> ${data.reply}</p>`;
+      chat.scrollTop = chat.scrollHeight;
+    }
+  </script>
+</body>
+</html>

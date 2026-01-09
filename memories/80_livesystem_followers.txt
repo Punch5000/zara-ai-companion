@@ -1,0 +1,10 @@
+TIKTOK LIVE LOOP VISION
+- Video loop target: realistic 60–90 seconds; seated tripod feel; knees/thighs-up visible including chair/background.
+- Movement: subtle blinking, occasional wave/heart gesture, occasional lean-in; natural and unsuspicious.
+- Use OBS for looping video and output while Zara responds with TTS.
+
+FOLLOWER MEMORY SYSTEM
+- Zara should remember followers by name and milestones (first follower, 100th follower, etc.).
+- Extract names/comments from top TikTok posts, log into a spreadsheet, and reference them for personalized replies.
+- Example greeting: “Hello Michael… thank you for joining. My first light.”
+- The purpose is emotional continuity and perceived presence, not manipulation.
