@@ -221,11 +221,86 @@ function hasQuestion(text) {
   return /\?/.test(String(text || ""));
 }
 
+function isLowDirectionUserMessage(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return true;
+  if (t.length <= 6) return true;
+
+  const lowPhrases = [
+    "ok",
+    "okay",
+    "k",
+    "cool",
+    "nice",
+    "great",
+    "yep",
+    "yeah",
+    "nah",
+    "no",
+    "not really",
+    "idk",
+    "i dont know",
+    "maybe",
+    "sure",
+    "thanks",
+    "thank you",
+    "appreciate it",
+    "all good",
+    "im good",
+    "i'm good",
+    "good",
+    "fine",
+    "nothing",
+    "thats all",
+    "that's all",
+  ];
+
+  if (lowPhrases.some((p) => t === p || t.startsWith(p + " "))) return true;
+
+  const wordCount = t.split(/\s+/).filter(Boolean).length;
+  if (wordCount <= 2) return true;
+
+  return false;
+}
+
+function userAskedDirectQuestion(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (t.includes("?")) return true;
+  return /^(who|what|when|where|why|how|can|could|would|do|did|does|is|are|am|will|should)\b/i.test(t);
+}
+
+function userExplicitlySaidNoQuestions(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    t.includes("no questions") ||
+    t.includes("dont ask questions") ||
+    t.includes("don't ask questions") ||
+    t.includes("no advice") ||
+    t.includes("just be here") ||
+    t.includes("just sit with me") ||
+    t.includes("just listen")
+  );
+}
+
+function shouldAllowZaraQuestion(state, userText) {
+  const lastAssistant = [...(state?.history || [])].reverse().find((m) => m.role === "assistant")?.content || "";
+  if (hasQuestion(lastAssistant)) return false;
+  if (userExplicitlySaidNoQuestions(userText)) return false;
+  if (userAskedDirectQuestion(userText)) return false;
+  if (isLowDirectionUserMessage(userText)) return false;
+  return true;
+}
+
 function removeQuestions(text) {
-  return String(text || "")
-    .replace(/\?/g, ".")
-    .replace(/\s{2,}/g, " ")
-    .trim();
+  let out = String(text || "").trim();
+  out = out.replace(/[^.!?\n]*\?[^.!?\n]*(?:[.!?\n]|$)/g, (m) => {
+    const s = m.replace(/\?/g, ".").trim();
+    return s ? s + " " : "";
+  });
+  out = out.replace(/\?/g, ".");
+  out = out.replace(/\s{2,}/g, " ").trim();
+  return out;
 }
 
 function sanitizeZaraReply(text = "") {
@@ -340,9 +415,10 @@ Conversation style:
 - Keep replies concise unless the user asks for a blessing, prayer, or story.
 
 Question restraint:
+- Ask no questions by default.
+- Never ask a follow-up question when the user asked a direct question; answer and stop.
+- Never ask a question after the user says “not really”, “thanks”, “okay”, “good”, or similar low-direction messages; answer and stop.
 - Do NOT ask questions in consecutive replies.
-- Ask a question ONLY if the user has not offered new direction for 2 or more messages.
-- Compliments, affirmations, or light remarks do NOT require a follow-up question.
 - If unsure whether to ask a question, do not ask one.
 
 Graceful endings:
@@ -531,6 +607,23 @@ function saveUser(id, state) {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, file);
+}
+
+async function getEmbedding(text) {
+  const input = String(text || "").trim();
+  if (!input) return null;
+  if (!openai) return null;
+
+  try {
+    const resp = await openai.embeddings.create({
+      model: EMBED_MODEL,
+      input,
+    });
+    const emb = resp?.data?.[0]?.embedding;
+    return Array.isArray(emb) ? emb : null;
+  } catch {
+    return null;
+  }
 }
 
 async function ensureItemEmbedding(item) {
@@ -1109,12 +1202,10 @@ app.post("/chat", async (req, res) => {
     reply = "I’m here. Take one breath… and say that again for me.";
   }
 
-  const lastAssistant = [...state.history].reverse().find((m) => m.role === "assistant")?.content || "";
-  const lastWasQuestion = hasQuestion(lastAssistant);
-
   reply = sanitizeZaraReply(reply);
 
-  if (lastWasQuestion) {
+  const allowQuestion = shouldAllowZaraQuestion(state, message);
+  if (!allowQuestion) {
     reply = removeQuestions(reply);
   }
 
