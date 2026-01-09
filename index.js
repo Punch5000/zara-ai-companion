@@ -18,6 +18,16 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const EMBED_MODEL = process.env.EMBED_MODEL || "text-embedding-3-small";
 
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
+const MEM_DIR = process.env.MEM_DIR || path.join(process.cwd(), "memories");
+
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch {}
+try {
+  fs.mkdirSync(MEM_DIR, { recursive: true });
+} catch {}
+
 function parseCookies(cookieHeader) {
   const out = {};
   if (!cookieHeader) return out;
@@ -115,7 +125,12 @@ function initialPermanence(category, content) {
 
   if (c === "identity" || c === "values" || c === "people") return "core";
   if (c === "goals" || c === "habits" || c === "preferences") return "sticky";
-  if (t.includes("my daughter") || t.includes("my son") || t.includes("my wife") || t.includes("my husband"))
+  if (
+    t.includes("my daughter") ||
+    t.includes("my son") ||
+    t.includes("my wife") ||
+    t.includes("my husband")
+  )
     return "core";
   if (t.includes("working on") || t.includes("my goal")) return "sticky";
 
@@ -213,11 +228,13 @@ function cosineSim(a, b) {
 
 function loadAllMemories(maxChars = 8000) {
   try {
-    const dir = path.join(process.cwd(), "memories");
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".txt")).sort();
+    const files = fs
+      .readdirSync(MEM_DIR)
+      .filter((f) => f.endsWith(".txt"))
+      .sort();
     let combined = "";
     for (const file of files) {
-      const content = fs.readFileSync(path.join(dir, file), "utf8").trim();
+      const content = fs.readFileSync(path.join(MEM_DIR, file), "utf8").trim();
       if (!content) continue;
       const chunk = `\n\n[${file}]\n${content}\n`;
       if (combined.length + chunk.length > maxChars) break;
@@ -336,9 +353,6 @@ Rules:
 - Confidence 0.95+ only if explicitly stated.
 - If confidence < 0.6: store false.
 `;
-
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function userFile(id) {
   const safe = Buffer.from(String(id)).toString("base64").replace(/[/+=]/g, "_");
@@ -809,8 +823,7 @@ async function runQuickMemoryCapture(state, userMessage) {
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 120,
-  handler: (req, res) =>
-    res.json({ reply: "Slow down for a moment, love. Try again in a few seconds." }),
+  handler: (req, res) => res.json({ reply: "Slow down for a moment, love. Try again in a few seconds." }),
 });
 app.use(limiter);
 
@@ -836,11 +849,7 @@ app.post("/chat", async (req, res) => {
     (selfModelContext ? `\n\nUSER STYLE MODEL (private):\n${selfModelContext}\n` : "") +
     (userMemoryContext ? `\n\nUSER MEMORY (most relevant):\n${userMemoryContext}\n` : "");
 
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...state.history,
-    { role: "user", content: message },
-  ];
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...state.history, { role: "user", content: message }];
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -863,6 +872,10 @@ app.post("/chat", async (req, res) => {
   res.json({ reply });
 });
 
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+
 app.listen(port, () => {
-  console.log(`Zara listening at http://localhost:${port}`);
+  console.log(`Zara listening on port ${port}`);
 });
