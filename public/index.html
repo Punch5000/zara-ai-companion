@@ -3,56 +3,69 @@
 <head>
   <title>Chat with Zara</title>
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 600px;
-      margin: 40px auto;
-    }
-    #chat {
-      border: 1px solid #ccc;
-      padding: 10px;
-      height: 400px;
-      overflow-y: auto;
-      margin-bottom: 10px;
-    }
-    input {
-      width: 78%;
-      padding: 10px;
-      box-sizing: border-box;
-    }
-    button {
-      padding: 10px;
-      width: 20%;
-    }
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; }
+    #chat { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; margin-bottom: 10px; }
+    input { width: 78%; padding: 10px; box-sizing: border-box; }
+    button { padding: 10px; width: 20%; }
+    .muted { opacity: 0.7; font-style: italic; }
   </style>
 </head>
 <body>
   <h2>Chat with Zara</h2>
   <div id="chat"></div>
   <input id="msg" placeholder="Speak to Zara..." />
-  <button onclick="send()">Send</button>
+  <button id="sendBtn" onclick="send()">Send</button>
 
   <script>
+    function escapeHtml(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
     async function send() {
       const input = document.getElementById("msg");
       const chat = document.getElementById("chat");
+      const btn = document.getElementById("sendBtn");
       const text = input.value.trim();
       if (!text) return;
 
-      chat.innerHTML += `<p><b>You:</b> ${text}</p>`;
+      chat.innerHTML += `<p><b>You:</b> ${escapeHtml(text)}</p>`;
       input.value = "";
 
-      const res = await fetch("/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ message: text })
-      });
-
-      const data = await res.json();
-      chat.innerHTML += `<p><b>Zara:</b> ${data.reply}</p>`;
+      btn.disabled = true;
+      const typingId = `t_${Date.now()}`;
+      chat.innerHTML += `<p id="${typingId}" class="muted"><b>Zara:</b> …</p>`;
       chat.scrollTop = chat.scrollHeight;
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ message: text })
+        });
+
+        const data = await res.json().catch(() => ({}));
+        const reply = data.reply || "I’m here. Say that again for me.";
+        const el = document.getElementById(typingId);
+        if (el) el.outerHTML = `<p><b>Zara:</b> ${escapeHtml(reply)}</p>`;
+      } catch {
+        const el = document.getElementById(typingId);
+        if (el) el.outerHTML = `<p><b>Zara:</b> I’m here… but something went wrong. Try again.</p>`;
+      } finally {
+        btn.disabled = false;
+        chat.scrollTop = chat.scrollHeight;
+        input.focus();
+      }
     }
+
+    document.getElementById("msg").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") send();
+    });
   </script>
 </body>
 </html>
