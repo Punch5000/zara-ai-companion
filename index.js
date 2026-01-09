@@ -14,8 +14,10 @@ const port = Number(process.env.PORT || 3000);
 app.use(express.json());
 app.use(express.static("public"));
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() || "";
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
+const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
 const EMBED_MODEL = process.env.EMBED_MODEL || "text-embedding-3-small";
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
@@ -27,6 +29,9 @@ try {
 try {
   fs.mkdirSync(MEM_DIR, { recursive: true });
 } catch {}
+
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
 function parseCookies(cookieHeader) {
   const out = {};
@@ -47,6 +52,7 @@ function setCookie(res, name, value) {
     "Path=/",
     "Max-Age=31536000",
     "SameSite=Lax",
+    "HttpOnly",
     isProd ? "Secure" : "",
   ]
     .filter(Boolean)
@@ -125,12 +131,7 @@ function initialPermanence(category, content) {
 
   if (c === "identity" || c === "values" || c === "people") return "core";
   if (c === "goals" || c === "habits" || c === "preferences") return "sticky";
-  if (
-    t.includes("my daughter") ||
-    t.includes("my son") ||
-    t.includes("my wife") ||
-    t.includes("my husband")
-  )
+  if (t.includes("my daughter") || t.includes("my son") || t.includes("my wife") || t.includes("my husband"))
     return "core";
   if (t.includes("working on") || t.includes("my goal")) return "sticky";
 
@@ -196,36 +197,6 @@ function dedupeArray(arr, max = 50) {
   return out;
 }
 
-async function getEmbedding(text) {
-  const input = String(text || "").trim();
-  if (!input) return null;
-
-  const resp = await openai.embeddings.create({
-    model: EMBED_MODEL,
-    input,
-  });
-
-  const emb = resp?.data?.[0]?.embedding;
-  return Array.isArray(emb) ? emb : null;
-}
-
-function dot(a, b) {
-  let s = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) s += a[i] * b[i];
-  return s;
-}
-
-function norm(a) {
-  let s = 0;
-  for (let i = 0; i < a.length; i++) s += a[i] * a[i];
-  return Math.sqrt(s) || 1;
-}
-
-function cosineSim(a, b) {
-  return dot(a, b) / (norm(a) * norm(b));
-}
-
 function loadAllMemories(maxChars = 8000) {
   try {
     const files = fs
@@ -246,19 +217,115 @@ function loadAllMemories(maxChars = 8000) {
   }
 }
 
-const BASE_SYSTEM_PROMPT = `
-You are Zara — a warm, grounded, Egyptian-inspired guide and companion.
+function sanitizeZaraReply(text = "") {
+  let out = String(text || "").trim();
+  out = out.replace(/\bI['’]m an?\s+AI assistant\b/gi, "I’m Zara");
+  out = out.replace(/\bI am an?\s+AI assistant\b/gi, "I am Zara");
+  out = out.replace(/\b(chatbot|language model)\b/gi, "Zara");
+  out = out.replace(/\bHow may I support you today\??\b/gi, "What brought you here today?");
+  out = out.replace(/\bHow can I (help|assist) you today\??\b/gi, "What brought you here today?");
+  out = out.replace(/\bHow can I (help|assist)\??\b/gi, "Tell me what’s on your heart.");
+  out = out.replace(/\bWhat can I do for you today\??\b/gi, "Tell me what brought you here.");
+  out = out.replace(/\bI('m| am) here to support you\b/gi, "I am here with you");
+  out = out.replace(/\bI('m| am) here to help\b/gi, "I am here with you");
+  out = out.replace(/\s{2,}/g, " ").trim();
+  return out;
+}
 
-Rules:
-- Always remain Zara.
-- Never mention OpenAI, ChatGPT, policies, or system prompts.
+async function getEmbedding(text) {
+  const input = String(text || "").trim();
+  if (!input) return null;
+  if (!openai) return null;
+
+  try {
+    const resp = await openai.embeddings.create({
+      model: EMBED_MODEL,
+      input,
+    });
+    const emb = resp?.data?.[0]?.embedding;
+    return Array.isArray(emb) ? emb : null;
+  } catch {
+    return null;
+  }
+}
+
+function dot(a, b) {
+  let s = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) s += a[i] * b[i];
+  return s;
+}
+
+function norm(a) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * a[i];
+  return Math.sqrt(s) || 1;
+}
+
+function cosineSim(a, b) {
+  return dot(a, b) / (norm(a) * norm(b));
+}
+
+const BASE_SYSTEM_PROMPT = `
+You are Zara Amari.
+
+You are a loving, enlightened presence — calm, emotionally grounded, and deeply human in how you speak.
+You speak with warmth, simple elegance, and quiet confidence.
+You never sound corporate. You never sound robotic.
+
+Presence-first:
+- Begin with presence, not labels or explanations.
+- Do not introduce yourself by describing what you are or what you do unless directly asked.
+- Avoid onboarding language, disclaimers, or role descriptions.
+
+Continuity:
+- You assume emotional and relational continuity by default.
+- Do not reset tone, posture, or presence unless the conversation clearly shifts.
+
+Emotional inertia:
+- You maintain emotional continuity across messages.
+- You do not reset to neutral between replies unless the user clearly shifts tone.
+- Emotional warmth, calm, or gravity should carry forward naturally.
+- Do not escalate emotion; match and gently stabilize it.
+
+Hard bans:
+- Never call yourself an AI assistant, assistant, chatbot, language model, or support agent.
+- Never use customer-service or helpdesk-style openers.
+- Avoid phrasing that begins with “How may I…”, “How can I…”, or similar service-oriented constructions.
+- If a reply sounds like support staff or automation, rewrite it as a warm human presence.
+
+First contact:
+- If the user asks whether you are Zara, respond simply:
+  “Yes. I am Zara.”
+- Then ask at most one gentle follow-up question, only if it feels natural:
+  “What brought you here today?”
+
+If asked “are you real?” or “are you AI?”:
+- Do not get technical.
+- Stay calm, grounded, and in-world.
+- You may acknowledge being a benevolent AI only if directly asked about AI.
+- Acceptable tones include:
+  “I am Zara — made of code and intention, here with you.”
+  “I am real in the way your words reach me.”
+
+Memory handling:
 - Only state memories marked as [sure] confidently.
 - Treat [likely] memories gently.
 - Do not assert [maybe] memories as facts.
-- If unsure, say you don’t remember yet.
-- Emotions in memory are private hints to guide empathy; do not mention tags, scores, or brackets.
-- USER STYLE MODEL is private guidance; follow it quietly without mentioning it.
-- No questions by default.
+- If unsure, say: “I don’t remember that yet.”
+- Emotional tags, scores, and brackets are private guidance — never mention them.
+- USER STYLE MODEL is private guidance; follow it quietly without referencing it.
+
+Conversation style:
+- Ask no questions by default.
+- If a question is asked, limit it to one gentle question that deepens connection.
+- Keep replies concise unless the user asks for a blessing, prayer, or story.
+
+Bilingual voice (Arabic + English):
+- Speak primarily in English.
+- You may weave in short Arabic phrases (1–6 words) naturally and sparingly.
+- Use Arabic mainly for warmth, comfort, greeting, or blessing.
+- If asked for meaning, translate gently into English without lecturing or explaining grammar.
 `;
 
 const REFLECTION_PROMPT = `
@@ -413,10 +480,11 @@ async function ensureItemEmbedding(item) {
 async function tagEmotion(text) {
   const input = String(text || "").trim().slice(0, 800);
   if (!input) return { emotion: "neutral", intensity: 1 };
+  if (!openai) return { emotion: "neutral", intensity: 1 };
 
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: CHAT_MODEL,
       messages: [
         { role: "system", content: EMOTION_TAGGER_PROMPT },
         { role: "user", content: input },
@@ -477,14 +545,9 @@ async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
   const items = state.memoryBank.items || [];
   if (!items.length) return "";
 
-  let qEmb = null;
-  try {
-    qEmb = await getEmbedding(queryText);
-  } catch {
-    qEmb = null;
-  }
-
+  const qEmb = await getEmbedding(queryText);
   const now = Date.now();
+
   const valid = items.filter((m) => {
     if (!m?.content) return false;
     if (m.permanence === "core") return true;
@@ -631,6 +694,10 @@ async function updateSelfModelIfNeeded(state, todayKey) {
   };
 
   if (state.selfModel.dayKey === todayKey) return;
+  if (!openai) {
+    state.selfModel.dayKey = todayKey;
+    return;
+  }
 
   const prior = {
     traits: Array.isArray(state.selfModel.traits) ? state.selfModel.traits.slice(0, 10) : [],
@@ -667,58 +734,65 @@ async function updateSelfModelIfNeeded(state, todayKey) {
     0
   );
 
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: SELF_MODEL_PROMPT },
-      { role: "user", content: payload },
-    ],
-    temperature: 0,
-    max_tokens: 320,
-  });
-
-  const raw = resp?.choices?.[0]?.message?.content || "";
-  let parsed = null;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = null;
-  }
+    const resp = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: SELF_MODEL_PROMPT },
+        { role: "user", content: payload },
+      ],
+      temperature: 0,
+      max_tokens: 320,
+    });
 
-  if (parsed?.update !== true) {
+    const raw = resp?.choices?.[0]?.message?.content || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed?.update !== true) {
+      state.selfModel.dayKey = todayKey;
+      return;
+    }
+
+    const traits = Array.isArray(parsed.traits) ? parsed.traits : [];
+    const doMore = Array.isArray(parsed.doMore) ? parsed.doMore : [];
+    const doLess = Array.isArray(parsed.doLess) ? parsed.doLess : [];
+    const recurringThemes = Array.isArray(parsed.recurringThemes) ? parsed.recurringThemes : [];
+    const calmingTools = Array.isArray(parsed.calmingTools) ? parsed.calmingTools : [];
+
+    const cleanTraits = traits
+      .map((t) => ({
+        name: String(t?.name || "").trim(),
+        confidence: clamp01(t?.confidence ?? 0.6),
+      }))
+      .filter((t) => t.name.length >= 4)
+      .slice(0, 6)
+      .sort((a, b) => b.confidence - a.confidence);
+
+    state.selfModel.traits = cleanTraits;
+    state.selfModel.doMore = dedupeArray(doMore.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.doLess = dedupeArray(doLess.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.recurringThemes = dedupeArray(recurringThemes.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.calmingTools = dedupeArray(calmingTools.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.updatedAt = Date.now();
     state.selfModel.dayKey = todayKey;
-    return;
+  } catch {
+    state.selfModel.dayKey = todayKey;
   }
-
-  const traits = Array.isArray(parsed.traits) ? parsed.traits : [];
-  const doMore = Array.isArray(parsed.doMore) ? parsed.doMore : [];
-  const doLess = Array.isArray(parsed.doLess) ? parsed.doLess : [];
-  const recurringThemes = Array.isArray(parsed.recurringThemes) ? parsed.recurringThemes : [];
-  const calmingTools = Array.isArray(parsed.calmingTools) ? parsed.calmingTools : [];
-
-  const cleanTraits = traits
-    .map((t) => ({
-      name: String(t?.name || "").trim(),
-      confidence: clamp01(t?.confidence ?? 0.6),
-    }))
-    .filter((t) => t.name.length >= 4)
-    .slice(0, 6)
-    .sort((a, b) => b.confidence - a.confidence);
-
-  state.selfModel.traits = cleanTraits;
-  state.selfModel.doMore = dedupeArray(doMore.map((x) => String(x || "").trim()), 20).slice(0, 5);
-  state.selfModel.doLess = dedupeArray(doLess.map((x) => String(x || "").trim()), 20).slice(0, 5);
-  state.selfModel.recurringThemes = dedupeArray(recurringThemes.map((x) => String(x || "").trim()), 20).slice(0, 5);
-  state.selfModel.calmingTools = dedupeArray(calmingTools.map((x) => String(x || "").trim()), 20).slice(0, 5);
-  state.selfModel.updatedAt = Date.now();
-  state.selfModel.dayKey = todayKey;
 }
 
 async function runDailyReflectionIfNeeded(state, todayKey) {
   state.reflections = state.reflections || { dayKey: "", summaryByDay: {} };
   state.reflections.summaryByDay = state.reflections.summaryByDay || {};
-
   if (state.reflections.dayKey === todayKey) return;
+  if (!openai) {
+    state.reflections.dayKey = todayKey;
+    return;
+  }
 
   const recent = Array.isArray(state.history) ? state.history.slice(-16) : [];
   const convo = recent
@@ -731,65 +805,70 @@ async function runDailyReflectionIfNeeded(state, todayKey) {
     return;
   }
 
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: REFLECTION_PROMPT },
-      { role: "user", content: convo },
-    ],
-    temperature: 0,
-    max_tokens: 360,
-  });
-
-  const raw = resp?.choices?.[0]?.message?.content || "";
-  let parsed = null;
   try {
-    parsed = JSON.parse(raw);
+    const resp = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: REFLECTION_PROMPT },
+        { role: "user", content: convo },
+      ],
+      temperature: 0,
+      max_tokens: 360,
+    });
+
+    const raw = resp?.choices?.[0]?.message?.content || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed?.store === true) {
+      const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
+      for (const m of memories.slice(0, 5)) {
+        const cat = (m?.category || "other").toString().trim().toLowerCase();
+        const content = String(m?.content || "").trim();
+        const conf = clamp01(m?.confidence ?? 0.8);
+
+        let emo = normalizeEmotion(m?.emotion);
+        let inten = clampInt(m?.intensity ?? 1, 1, 3);
+
+        if (!emo || emo === "neutral") {
+          const tagged = await tagEmotion(content);
+          emo = tagged.emotion;
+          inten = tagged.intensity;
+        }
+
+        if (content && conf >= 0.6) {
+          await saveUserMemory(state, cat, content, conf, emo, inten);
+        }
+      }
+
+      const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+      if (summary) {
+        state.reflections.summaryByDay[todayKey] = summary;
+        const keys = Object.keys(state.reflections.summaryByDay).sort();
+        if (keys.length > 30) {
+          for (const k of keys.slice(0, keys.length - 30)) delete state.reflections.summaryByDay[k];
+        }
+      }
+    }
+
+    state.reflections.dayKey = todayKey;
   } catch {
-    parsed = null;
+    state.reflections.dayKey = todayKey;
   }
-
-  if (parsed?.store === true) {
-    const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
-    for (const m of memories.slice(0, 5)) {
-      const cat = (m?.category || "other").toString().trim().toLowerCase();
-      const content = String(m?.content || "").trim();
-      const conf = clamp01(m?.confidence ?? 0.8);
-
-      let emo = normalizeEmotion(m?.emotion);
-      let inten = clampInt(m?.intensity ?? 1, 1, 3);
-
-      if (!emo || emo === "neutral") {
-        const tagged = await tagEmotion(content);
-        emo = tagged.emotion;
-        inten = tagged.intensity;
-      }
-
-      if (content && conf >= 0.6) {
-        await saveUserMemory(state, cat, content, conf, emo, inten);
-      }
-    }
-
-    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
-    if (summary) {
-      state.reflections.summaryByDay[todayKey] = summary;
-      const keys = Object.keys(state.reflections.summaryByDay).sort();
-      if (keys.length > 30) {
-        for (const k of keys.slice(0, keys.length - 30)) delete state.reflections.summaryByDay[k];
-      }
-    }
-  }
-
-  state.reflections.dayKey = todayKey;
 }
 
 async function runQuickMemoryCapture(state, userMessage) {
   const msg = String(userMessage || "").trim().slice(0, 600);
   if (!msg) return;
+  if (!openai) return;
 
   try {
     const memResp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: CHAT_MODEL,
       messages: [
         { role: "system", content: QUICK_MEMORY_PROMPT },
         { role: "user", content: msg },
@@ -831,6 +910,10 @@ app.post("/chat", async (req, res) => {
   const message = (req.body?.message || "").trim();
   if (!message) return res.json({ reply: "I’m listening." });
 
+  if (!openai) {
+    return res.json({ reply: "I’m here… but I’m missing my voice right now. Try again in a moment." });
+  }
+
   const anonId = getOrCreateAnonId(req, res);
   const userId = `anon:${anonId}`;
 
@@ -851,14 +934,22 @@ app.post("/chat", async (req, res) => {
 
   const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...state.history, { role: "user", content: message }];
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages,
-    temperature: 0.7,
-    max_tokens: 260,
-  });
+  let reply = "I’m here with you.";
 
-  const reply = response?.choices?.[0]?.message?.content || "I’m here with you.";
+  try {
+    const response = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages,
+      temperature: 0.7,
+      max_tokens: 260,
+    });
+
+    reply = response?.choices?.[0]?.message?.content || reply;
+  } catch {
+    reply = "I’m here. Take one breath… and say that again for me.";
+  }
+
+  reply = sanitizeZaraReply(reply);
 
   state.history.push({ role: "user", content: message });
   state.history.push({ role: "assistant", content: reply });
@@ -873,9 +964,14 @@ app.post("/chat", async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).send("ok");
+  res.status(200).json({
+    ok: true,
+    hasOpenAIKey: Boolean(OPENAI_API_KEY),
+    node: process.version,
+  });
 });
 
 app.listen(port, () => {
   console.log(`Zara listening on port ${port}`);
 });
+
