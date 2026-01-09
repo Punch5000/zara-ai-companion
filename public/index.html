@@ -3,10 +3,27 @@
 <head>
   <title>Chat with Zara</title>
   <style>
-    body { font-family: Arial; max-width: 600px; margin: 40px auto; }
-    #chat { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; }
-    input { width: 80%; padding: 10px; }
-    button { padding: 10px; }
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+    }
+    #chat {
+      border: 1px solid #ccc;
+      padding: 10px;
+      height: 400px;
+      overflow-y: auto;
+      margin-bottom: 10px;
+    }
+    input {
+      width: 78%;
+      padding: 10px;
+      box-sizing: border-box;
+    }
+    button {
+      padding: 10px;
+      width: 20%;
+    }
   </style>
 </head>
 <body>
@@ -19,7 +36,7 @@
     async function send() {
       const input = document.getElementById("msg");
       const chat = document.getElementById("chat");
-      const text = input.value;
+      const text = input.value.trim();
       if (!text) return;
 
       chat.innerHTML += `<p><b>You:</b> ${text}</p>`;
@@ -28,6 +45,7 @@
       const res = await fetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ message: text })
       });
 
