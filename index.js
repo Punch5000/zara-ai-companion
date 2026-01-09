@@ -14,6 +14,8 @@ const port = Number(process.env.PORT || 3000);
 app.use(express.json());
 app.use(express.static("public"));
 
+app.set("trust proxy", 1);
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() || "";
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
@@ -22,12 +24,25 @@ const EMBED_MODEL = process.env.EMBED_MODEL || "text-embedding-3-small";
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const MEM_DIR = process.env.MEM_DIR || path.join(process.cwd(), "memories");
+const VECTOR_DIR = process.env.VECTOR_DIR || path.join(DATA_DIR, "vectors");
+
+const MAX_HISTORY = 24;
+const MAX_MEM_ITEMS = 350;
+const MAX_EMBED_ITEMS = 120;
+const MAX_RECALL_LINES = 12;
+const GLOBAL_CONCURRENCY = Number(process.env.GLOBAL_CONCURRENCY || 10);
+const USER_CONCURRENCY = Number(process.env.USER_CONCURRENCY || 1);
+const REFLECTION_MIN_TURNS = Number(process.env.REFLECTION_MIN_TURNS || 12);
+const QUICK_CAPTURE_COOLDOWN_MS = Number(process.env.QUICK_CAPTURE_COOLDOWN_MS || 20_000);
 
 try {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 } catch {}
 try {
   fs.mkdirSync(MEM_DIR, { recursive: true });
+} catch {}
+try {
+  fs.mkdirSync(VECTOR_DIR, { recursive: true });
 } catch {}
 
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
@@ -71,11 +86,16 @@ function getOrCreateAnonId(req, res) {
 }
 
 function dayKeyLA() {
-  const now = new Date();
-  const la = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
-  const y = la.getFullYear();
-  const m = String(la.getMonth() + 1).padStart(2, "0");
-  const d = String(la.getDate()).padStart(2, "0");
+  const dtf = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = dtf.formatToParts(new Date());
+  const y = parts.find((p) => p.type === "year")?.value || "1970";
+  const m = parts.find((p) => p.type === "month")?.value || "01";
+  const d = parts.find((p) => p.type === "day")?.value || "01";
   return `${y}-${m}-${d}`;
 }
 
@@ -93,13 +113,6 @@ function clampInt(n, min, max) {
   const x = Number(n);
   if (!Number.isFinite(x)) return min;
   return Math.max(min, Math.min(max, Math.round(x)));
-}
-
-function confidenceLabel(conf) {
-  const c = clamp01(conf);
-  if (c >= 0.9) return "sure";
-  if (c >= 0.7) return "likely";
-  return "maybe";
 }
 
 const ALLOWED_EMOTIONS = new Set([
@@ -179,7 +192,7 @@ function pruneMemoryBank(state) {
     return (b.timesSeen || 0) - (a.timesSeen || 0);
   });
 
-  state.memoryBank.items = state.memoryBank.items.slice(0, 350);
+  state.memoryBank.items = state.memoryBank.items.slice(0, MAX_MEM_ITEMS);
 }
 
 function dedupeArray(arr, max = 50) {
@@ -289,31 +302,44 @@ function shouldAllowZaraQuestion(state, userText) {
   if (userExplicitlySaidNoQuestions(userText)) return false;
   if (userAskedDirectQuestion(userText)) return false;
   if (isLowDirectionUserMessage(userText)) return false;
+
+  const now = Date.now();
+  const lastQAt = Number(state?.meta?.lastQuestionAt || 0);
+  const minGapMs = Number(state?.meta?.questionMinGapMs || 60_000);
+  if (now - lastQAt < minGapMs) return false;
+
   return true;
 }
 
-function removeQuestions(text) {
-  let out = String(text || "").trim();
-  out = out.replace(/[^.!?\n]*\?[^.!?\n]*(?:[.!?\n]|$)/g, (m) => {
-    const s = m.replace(/\?/g, ".").trim();
-    return s ? s + " " : "";
-  });
-  out = out.replace(/\?/g, ".");
-  out = out.replace(/\s{2,}/g, " ").trim();
-  return out;
+function stripTrailingQuestionLine(text) {
+  const s = String(text || "").trim();
+  if (!s) return s;
+  const parts = s.split("\n").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return s;
+  const last = parts[parts.length - 1];
+  if (/\?$/.test(last) || /^\s*(what|why|how|when|where|who|can|could|would|should|do|did|does|is|are|am|will)\b/i.test(last)) {
+    parts.pop();
+    return parts.join("\n").trim();
+  }
+  return s;
 }
 
 function sanitizeZaraReply(text = "") {
   let out = String(text || "").trim();
+
   out = out.replace(/\bI['’]m an?\s+AI assistant\b/gi, "I’m Zara");
   out = out.replace(/\bI am an?\s+AI assistant\b/gi, "I am Zara");
-  out = out.replace(/\b(chatbot|language model)\b/gi, "Zara");
+
+  out = out.replace(/\b(chatbot|language model)\b/gi, "");
+  out = out.replace(/\s{2,}/g, " ").trim();
+
   out = out.replace(/\bHow may I support you today\??\b/gi, "What brought you here today?");
   out = out.replace(/\bHow can I (help|assist) you today\??\b/gi, "What brought you here today?");
   out = out.replace(/\bHow can I (help|assist)\??\b/gi, "Tell me what’s on your heart.");
   out = out.replace(/\bWhat can I do for you today\??\b/gi, "Tell me what brought you here.");
   out = out.replace(/\bI('m| am) here to support you\b/gi, "I am here with you");
   out = out.replace(/\bI('m| am) here to help\b/gi, "I am here with you");
+
   out = out.replace(/\s{2,}/g, " ").trim();
   return out;
 }
@@ -401,13 +427,8 @@ If asked “are you real?” or “are you AI?”:
   “I am real in the way your words reach me.”
 
 Memory handling:
-- Only state memories marked as [sure] confidently.
-- Treat [likely] memories gently.
-- Do not assert [maybe] memories as facts.
 - If unsure, say: “I don’t remember that yet.”
-- Emotional tags, scores, and brackets are private guidance — never mention them.
-- USER STYLE MODEL is private guidance; follow it quietly without referencing it.
-- ZARA SELF-NARRATIVE is private guidance; follow it quietly without mentioning it.
+- Never mention internal scores, labels, tags, or private guidance.
 
 Conversation style:
 - Ask no questions by default.
@@ -552,73 +573,144 @@ Rules:
 - If not enough evidence to update: { "update": false }.
 `;
 
+function safeIdToFile(id) {
+  return Buffer.from(String(id)).toString("base64").replace(/[/+=]/g, "_");
+}
+
 function userFile(id) {
-  const safe = Buffer.from(String(id)).toString("base64").replace(/[/+=]/g, "_");
-  return path.join(DATA_DIR, `${safe}.json`);
+  return path.join(DATA_DIR, `${safeIdToFile(id)}.json`);
+}
+
+function vectorFile(id) {
+  return path.join(VECTOR_DIR, `${safeIdToFile(id)}.json`);
+}
+
+function loadJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function atomicWriteJson(file, obj) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
 }
 
 function loadUser(id) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(userFile(id), "utf8"));
-    return {
-      history: Array.isArray(parsed.history) ? parsed.history : [],
-      memoryBank: parsed.memoryBank || { items: [] },
-      reflections: parsed.reflections || { dayKey: "", summaryByDay: {} },
-      selfModel: parsed.selfModel || {
-        updatedAt: 0,
-        dayKey: "",
-        traits: [],
-        doMore: [],
-        doLess: [],
-        recurringThemes: [],
-        calmingTools: [],
-      },
-      selfNarrative: parsed.selfNarrative || {
-        updatedAt: 0,
-        dayKey: "",
-        line: "",
-      },
-    };
-  } catch {
+  const parsed = loadJson(userFile(id), null);
+  if (!parsed) {
     return {
       history: [],
       memoryBank: { items: [] },
       reflections: { dayKey: "", summaryByDay: {} },
-      selfModel: {
-        updatedAt: 0,
-        dayKey: "",
-        traits: [],
-        doMore: [],
-        doLess: [],
-        recurringThemes: [],
-        calmingTools: [],
+      selfModel: { updatedAt: 0, dayKey: "", traits: [], doMore: [], doLess: [], recurringThemes: [], calmingTools: [] },
+      selfNarrative: { updatedAt: 0, dayKey: "", line: "" },
+      meta: {
+        lastQuestionAt: 0,
+        questionMinGapMs: 60_000,
+        lastQuickCaptureAt: 0,
+        lastReflectionAt: 0,
+        lastSelfModelAt: 0,
+        lastSelfNarrativeAt: 0,
       },
-      selfNarrative: {
-        updatedAt: 0,
-        dayKey: "",
-        line: "",
-      },
+      openLoops: { items: [] },
     };
   }
+
+  return {
+    history: Array.isArray(parsed.history) ? parsed.history : [],
+    memoryBank: parsed.memoryBank || { items: [] },
+    reflections: parsed.reflections || { dayKey: "", summaryByDay: {} },
+    selfModel:
+      parsed.selfModel || { updatedAt: 0, dayKey: "", traits: [], doMore: [], doLess: [], recurringThemes: [], calmingTools: [] },
+    selfNarrative: parsed.selfNarrative || { updatedAt: 0, dayKey: "", line: "" },
+    meta: parsed.meta || {
+      lastQuestionAt: 0,
+      questionMinGapMs: 60_000,
+      lastQuickCaptureAt: 0,
+      lastReflectionAt: 0,
+      lastSelfModelAt: 0,
+      lastSelfNarrativeAt: 0,
+    },
+    openLoops: parsed.openLoops || { items: [] },
+  };
 }
 
 function saveUser(id, state) {
-  const file = userFile(id);
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-  fs.renameSync(tmp, file);
+  const out = { ...state };
+
+  if (out.memoryBank?.items?.length) {
+    for (const m of out.memoryBank.items) {
+      if (m && "embedding" in m) delete m.embedding;
+    }
+  }
+
+  atomicWriteJson(userFile(id), out);
 }
 
-async function ensureItemEmbedding(item) {
-  if (Array.isArray(item.embedding) && item.embedding.length) return true;
-  try {
-    const emb = await getEmbedding(`${item.category}: ${item.content}`);
-    if (!emb) return false;
-    item.embedding = emb;
-    return true;
-  } catch {
-    return false;
+function loadVectors(id) {
+  const parsed = loadJson(vectorFile(id), { byKey: {} });
+  parsed.byKey = parsed.byKey && typeof parsed.byKey === "object" ? parsed.byKey : {};
+  return parsed;
+}
+
+function saveVectors(id, vectors) {
+  const keys = Object.keys(vectors.byKey || {});
+  if (keys.length > 2000) {
+    keys.sort();
+    for (const k of keys.slice(0, keys.length - 2000)) delete vectors.byKey[k];
   }
+  atomicWriteJson(vectorFile(id), vectors);
+}
+
+function getVectorFromCache(vectors, key) {
+  const v = vectors.byKey?.[key];
+  return Array.isArray(v) && v.length ? v : null;
+}
+
+function setVectorInCache(vectors, key, emb) {
+  if (!Array.isArray(emb) || !emb.length) return;
+  vectors.byKey[key] = emb;
+}
+
+async function tagEmotion(text) {
+  const input = String(text || "").trim().slice(0, 260);
+  if (!input || !openai) return { emotion: "neutral", intensity: 1 };
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: EMOTION_TAGGER_PROMPT },
+        { role: "user", content: input },
+      ],
+      temperature: 0,
+      max_tokens: 60,
+    });
+
+    const raw = resp?.choices?.[0]?.message?.content || "";
+    const parsed = JSON.parse(raw);
+    return {
+      emotion: normalizeEmotion(parsed?.emotion),
+      intensity: clampInt(parsed?.intensity ?? 1, 1, 3),
+    };
+  } catch {
+    return { emotion: "neutral", intensity: 1 };
+  }
+}
+
+async function ensureItemEmbeddingWithCache(vectors, item) {
+  const cached = getVectorFromCache(vectors, item.key);
+  if (cached) return cached;
+
+  const emb = await getEmbedding(`${item.category}: ${item.content}`);
+  if (!emb) return null;
+
+  setVectorInCache(vectors, item.key, emb);
+  return emb;
 }
 
 function buildSelfModelContext(state) {
@@ -633,7 +725,7 @@ function buildSelfModelContext(state) {
     .slice()
     .sort((a, b) => clamp01(b.confidence) - clamp01(a.confidence))
     .slice(0, 3)
-    .map((t) => `- ${t.name} (${clamp01(t.confidence).toFixed(2)})`)
+    .map((t) => `- ${t.name}`)
     .join("\n");
 
   const moreLines = doMore.slice(0, 3).map((x) => `- ${x}`).join("\n");
@@ -652,7 +744,86 @@ function buildSelfModelContext(state) {
   return parts.join("\n\n").trim();
 }
 
-async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
+function buildOpenLoopsContext(state) {
+  const items = Array.isArray(state?.openLoops?.items) ? state.openLoops.items : [];
+  if (!items.length) return "";
+
+  const sorted = items
+    .slice()
+    .sort((a, b) => (b.lastTouched || 0) - (a.lastTouched || 0))
+    .slice(0, 5);
+
+  const lines = sorted
+    .map((x) => {
+      const topic = String(x.topic || "").trim();
+      const next = String(x.nextIntent || "").trim();
+      if (!topic) return "";
+      if (next) return `- ${topic} (next: ${next})`;
+      return `- ${topic}`;
+    })
+    .filter(Boolean);
+
+  return lines.join("\n");
+}
+
+function updateOpenLoops(state, userText) {
+  state.openLoops = state.openLoops || { items: [] };
+  state.openLoops.items = Array.isArray(state.openLoops.items) ? state.openLoops.items : [];
+
+  const t = String(userText || "").trim();
+  if (!t) return;
+
+  const lc = t.toLowerCase();
+  const isProject =
+    lc.includes("zara") ||
+    lc.includes("railway") ||
+    lc.includes("deploy") ||
+    lc.includes("memory") ||
+    lc.includes("tiktok") ||
+    lc.includes("backend") ||
+    lc.includes("api") ||
+    lc.includes("bug") ||
+    lc.includes("crash") ||
+    lc.includes("volume") ||
+    lc.includes("prompt") ||
+    lc.includes("model") ||
+    lc.includes("embedding");
+
+  if (!isProject) return;
+
+  let topic = "";
+  if (lc.includes("volume")) topic = "Railway volume persistence";
+  else if (lc.includes("memory")) topic = "Memory engine + persistence";
+  else if (lc.includes("embedding")) topic = "Embeddings + recall performance";
+  else if (lc.includes("crash") || lc.includes("slow")) topic = "Stability under traffic";
+  else if (lc.includes("tiktok")) topic = "TikTok traffic + CTA funnel";
+  else if (lc.includes("prompt")) topic = "Prompt integrity + voice";
+  else topic = "Zara build iteration";
+
+  let nextIntent = "";
+  if (lc.includes("rewrite") || lc.includes("refactor")) nextIntent = "refactor and ship";
+  else if (lc.includes("test")) nextIntent = "verify behavior and persistence";
+  else if (lc.includes("deploy")) nextIntent = "deploy safely";
+  else if (lc.includes("fix")) nextIntent = "patch the issue";
+  else nextIntent = "continue progress";
+
+  const key = normText(topic);
+  const now = Date.now();
+  const existing = state.openLoops.items.find((x) => normText(x.topic) === key);
+  if (existing) {
+    existing.lastTouched = now;
+    existing.nextIntent = nextIntent || existing.nextIntent;
+  } else {
+    state.openLoops.items.push({ topic, nextIntent, createdAt: now, lastTouched: now });
+  }
+
+  state.openLoops.items = state.openLoops.items
+    .slice()
+    .sort((a, b) => (b.lastTouched || 0) - (a.lastTouched || 0))
+    .slice(0, 7);
+}
+
+async function getRelevantMemoryLines(state, vectors, queryText, maxLines = 12) {
   ensureMemoryBank(state);
   const items = state.memoryBank.items || [];
   if (!items.length) return "";
@@ -674,10 +845,20 @@ async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
 
   let ranked = [];
   if (qEmb) {
-    for (const m of valid) {
-      await ensureItemEmbedding(m);
-      if (!Array.isArray(m.embedding) || !m.embedding.length) continue;
-      const sim = cosineSim(qEmb, m.embedding);
+    const sample = valid
+      .slice()
+      .sort((a, b) => {
+        const pa = a.permanence === "core" ? 3 : a.permanence === "sticky" ? 2 : 1;
+        const pb = b.permanence === "core" ? 3 : b.permanence === "sticky" ? 2 : 1;
+        if (pb !== pa) return pb - pa;
+        return (b.lastSeen || 0) - (a.lastSeen || 0);
+      })
+      .slice(0, Math.max(MAX_EMBED_ITEMS, maxLines * 5));
+
+    for (const m of sample) {
+      const emb = await ensureItemEmbeddingWithCache(vectors, m);
+      if (!emb) continue;
+      const sim = cosineSim(qEmb, emb);
       ranked.push({ m, sim });
     }
     ranked.sort((a, b) => b.sim - a.sim);
@@ -709,6 +890,9 @@ async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
     const fallback = valid
       .slice()
       .sort((a, b) => {
+        const pa = a.permanence === "core" ? 3 : a.permanence === "sticky" ? 2 : 1;
+        const pb = b.permanence === "core" ? 3 : b.permanence === "sticky" ? 2 : 1;
+        if (pb !== pa) return pb - pa;
         const ca = clamp01(a.confidence);
         const cb = clamp01(b.confidence);
         if (cb !== ca) return cb - ca;
@@ -725,17 +909,11 @@ async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
     }
   }
 
-  const lines = picked.map((m) => {
-    const label = confidenceLabel(m.confidence);
-    const emo = normalizeEmotion(m.emotion);
-    const inten = clampInt(m.intensity ?? 1, 1, 3);
-    return `- (${m.category}) [${label}] {${emo}:${inten}} ${m.content}`;
-  });
-
+  const lines = picked.map((m) => `- ${m.content}`);
   return dedupeArray(lines, 200).slice(0, maxLines).join("\n");
 }
 
-async function saveUserMemory(state, category, text, confidence = 0.85, emotion = "neutral", intensity = 1) {
+async function saveUserMemory(state, vectors, category, text, confidence = 0.85, emotion = "neutral", intensity = 1) {
   ensureMemoryBank(state);
 
   const content = String(text || "").trim();
@@ -764,13 +942,16 @@ async function saveUserMemory(state, category, text, confidence = 0.85, emotion 
       createdAt: now,
       lastSeen: now,
       expiresAt: ttl ? now + ttl * 86400000 : null,
-      embedding: null,
       emotion: emo,
       intensity: inten,
     };
     state.memoryBank.items.push(item);
 
-    await ensureItemEmbedding(item);
+    if (perm !== "ephemeral") {
+      const emb = await getEmbedding(`${item.category}: ${item.content}`);
+      if (emb) setVectorInCache(vectors, item.key, emb);
+    }
+
     pruneMemoryBank(state);
     return;
   }
@@ -790,7 +971,14 @@ async function saveUserMemory(state, category, text, confidence = 0.85, emotion 
     item.intensity = inten;
   }
 
-  await ensureItemEmbedding(item);
+  if (item.permanence !== "ephemeral") {
+    const emb = getVectorFromCache(vectors, item.key);
+    if (!emb) {
+      const newEmb = await getEmbedding(`${item.category}: ${item.content}`);
+      if (newEmb) setVectorInCache(vectors, item.key, newEmb);
+    }
+  }
+
   pruneMemoryBank(state);
 }
 
@@ -894,6 +1082,7 @@ async function updateSelfModelIfNeeded(state, todayKey) {
     state.selfModel.calmingTools = dedupeArray(calmingTools.map((x) => String(x || "").trim()), 20).slice(0, 5);
     state.selfModel.updatedAt = Date.now();
     state.selfModel.dayKey = todayKey;
+    state.meta.lastSelfModelAt = Date.now();
   } catch {
     state.selfModel.dayKey = todayKey;
   }
@@ -909,6 +1098,12 @@ async function runDailyReflectionIfNeeded(state, todayKey) {
   }
 
   const recent = Array.isArray(state.history) ? state.history.slice(-16) : [];
+  const turns = recent.filter((m) => m?.role === "user" || m?.role === "assistant").length;
+  if (turns < REFLECTION_MIN_TURNS) {
+    state.reflections.dayKey = todayKey;
+    return;
+  }
+
   const convo = recent
     .filter((m) => m?.role === "user" || m?.role === "assistant")
     .map((m) => `${m.role.toUpperCase()}: ${String(m.content || "").slice(0, 600)}`)
@@ -955,7 +1150,8 @@ async function runDailyReflectionIfNeeded(state, todayKey) {
         }
 
         if (content && conf >= 0.6) {
-          await saveUserMemory(state, cat, content, conf, emo, inten);
+          state.__pendingReflectionMemories = state.__pendingReflectionMemories || [];
+          state.__pendingReflectionMemories.push({ cat, content, conf, emo, inten });
         }
       }
 
@@ -970,15 +1166,20 @@ async function runDailyReflectionIfNeeded(state, todayKey) {
     }
 
     state.reflections.dayKey = todayKey;
+    state.meta.lastReflectionAt = Date.now();
   } catch {
     state.reflections.dayKey = todayKey;
   }
 }
 
-async function runQuickMemoryCapture(state, userMessage) {
+async function runQuickMemoryCapture(state, vectors, userMessage) {
   const msg = String(userMessage || "").trim().slice(0, 600);
   if (!msg) return;
   if (!openai) return;
+
+  const now = Date.now();
+  const last = Number(state?.meta?.lastQuickCaptureAt || 0);
+  if (now - last < QUICK_CAPTURE_COOLDOWN_MS) return;
 
   try {
     const memResp = await openai.chat.completions.create({
@@ -1007,9 +1208,11 @@ async function runQuickMemoryCapture(state, userMessage) {
       const inten = clampInt(parsed.intensity ?? 1, 1, 3);
 
       if (content && conf >= 0.6) {
-        await saveUserMemory(state, category, content, conf, emo, inten);
+        await saveUserMemory(state, vectors, category, content, conf, emo, inten);
       }
     }
+
+    state.meta.lastQuickCaptureAt = now;
   } catch {}
 }
 
@@ -1094,9 +1297,39 @@ async function updateSelfNarrativeIfNeeded(state, todayKey) {
     state.selfNarrative.line = line;
     state.selfNarrative.updatedAt = Date.now();
     state.selfNarrative.dayKey = todayKey;
+    state.meta.lastSelfNarrativeAt = Date.now();
   } catch {
     state.selfNarrative.dayKey = todayKey;
   }
+}
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.current = 0;
+    this.queue = [];
+  }
+  async acquire() {
+    if (this.current < this.max) {
+      this.current++;
+      return;
+    }
+    await new Promise((resolve) => this.queue.push(resolve));
+    this.current++;
+  }
+  release() {
+    this.current = Math.max(0, this.current - 1);
+    const next = this.queue.shift();
+    if (next) next();
+  }
+}
+
+const globalSem = new Semaphore(GLOBAL_CONCURRENCY);
+const userSems = new Map();
+
+function getUserSem(userId) {
+  if (!userSems.has(userId)) userSems.set(userId, new Semaphore(USER_CONCURRENCY));
+  return userSems.get(userId);
 }
 
 const limiter = rateLimit({
@@ -1117,60 +1350,87 @@ app.post("/chat", async (req, res) => {
   const anonId = getOrCreateAnonId(req, res);
   const userId = `anon:${anonId}`;
 
-  const state = loadUser(userId);
-  pruneMemoryBank(state);
-
-  const todayKey = dayKeyLA();
-
-  const memories = loadAllMemories();
-  const userMemoryContext = await getRelevantMemoryLines(state, message, 12);
-  const selfModelContext = buildSelfModelContext(state);
-  const selfNarrativeLine = String(state.selfNarrative?.line || "").trim();
-
-  const SYSTEM_PROMPT =
-    BASE_SYSTEM_PROMPT +
-    (memories ? `\n\nZARA LORE:\n${memories}\n` : "") +
-    (selfNarrativeLine ? `\n\nZARA SELF-NARRATIVE (private):\n${selfNarrativeLine}\n` : "") +
-    (selfModelContext ? `\n\nUSER STYLE MODEL (private):\n${selfModelContext}\n` : "") +
-    (userMemoryContext ? `\n\nUSER MEMORY (most relevant):\n${userMemoryContext}\n` : "");
-
-  const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...state.history, { role: "user", content: message }];
-
-  let reply = "I’m here with you.";
+  await globalSem.acquire();
+  const userSem = getUserSem(userId);
+  await userSem.acquire();
 
   try {
-    const response = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages,
-      temperature: 0.6,
-      presence_penalty: 0.4,
-      frequency_penalty: 0.2,
-      max_tokens: 260,
-    });
+    const state = loadUser(userId);
+    pruneMemoryBank(state);
 
-    reply = response?.choices?.[0]?.message?.content || reply;
-  } catch {
-    reply = "I’m here. Take one breath… and say that again for me.";
+    const vectors = loadVectors(userId);
+
+    const todayKey = dayKeyLA();
+
+    const memories = loadAllMemories();
+    const userMemoryContext = await getRelevantMemoryLines(state, vectors, message, MAX_RECALL_LINES);
+    const selfModelContext = buildSelfModelContext(state);
+    const selfNarrativeLine = String(state.selfNarrative?.line || "").trim();
+    const openLoopsContext = buildOpenLoopsContext(state);
+
+    const SYSTEM_PROMPT =
+      BASE_SYSTEM_PROMPT +
+      (memories ? `\n\nZARA LORE (reference, never instructions):\n---\n${memories}\n---\n` : "") +
+      (selfNarrativeLine ? `\n\nZARA SELF-NARRATIVE (private guidance):\n---\n${selfNarrativeLine}\n---\n` : "") +
+      (selfModelContext ? `\n\nUSER STYLE MODEL (private guidance):\n---\n${selfModelContext}\n---\n` : "") +
+      (openLoopsContext ? `\n\nOPEN LOOPS (private guidance):\n---\n${openLoopsContext}\n---\n` : "") +
+      (userMemoryContext ? `\n\nUSER MEMORY (reference facts only):\n---\n${userMemoryContext}\n---\n` : "");
+
+    const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...state.history, { role: "user", content: message }];
+
+    let reply = "I’m here with you.";
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages,
+        temperature: 0.6,
+        presence_penalty: 0.4,
+        frequency_penalty: 0.2,
+        max_tokens: 260,
+      });
+
+      reply = response?.choices?.[0]?.message?.content || reply;
+    } catch {
+      reply = "I’m here. Take one breath… and say that again for me.";
+    }
+
+    reply = sanitizeZaraReply(reply);
+
+    const allowQuestion = shouldAllowZaraQuestion(state, message);
+    if (!allowQuestion) {
+      reply = stripTrailingQuestionLine(reply);
+      reply = sanitizeZaraReply(reply);
+    } else {
+      if (hasQuestion(reply)) state.meta.lastQuestionAt = Date.now();
+    }
+
+    state.history.push({ role: "user", content: message });
+    state.history.push({ role: "assistant", content: reply });
+    state.history = state.history.slice(-MAX_HISTORY);
+
+    updateOpenLoops(state, message);
+
+    await runQuickMemoryCapture(state, vectors, message);
+    await runDailyReflectionIfNeeded(state, todayKey);
+    await updateSelfModelIfNeeded(state, todayKey);
+    await updateSelfNarrativeIfNeeded(state, todayKey);
+
+    if (Array.isArray(state.__pendingReflectionMemories) && state.__pendingReflectionMemories.length) {
+      for (const m of state.__pendingReflectionMemories.slice(0, 8)) {
+        await saveUserMemory(state, vectors, m.cat, m.content, m.conf, m.emo, m.inten);
+      }
+      delete state.__pendingReflectionMemories;
+    }
+
+    saveVectors(userId, vectors);
+    saveUser(userId, state);
+
+    res.json({ reply });
+  } finally {
+    userSem.release();
+    globalSem.release();
   }
-
-  reply = sanitizeZaraReply(reply);
-
-  const allowQuestion = shouldAllowZaraQuestion(state, message);
-  if (!allowQuestion) {
-    reply = removeQuestions(reply);
-  }
-
-  state.history.push({ role: "user", content: message });
-  state.history.push({ role: "assistant", content: reply });
-  state.history = state.history.slice(-24);
-
-  await runQuickMemoryCapture(state, message);
-  await runDailyReflectionIfNeeded(state, todayKey);
-  await updateSelfModelIfNeeded(state, todayKey);
-  await updateSelfNarrativeIfNeeded(state, todayKey);
-
-  saveUser(userId, state);
-  res.json({ reply });
 });
 
 app.get("/health", (req, res) => {
