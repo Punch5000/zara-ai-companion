@@ -609,23 +609,6 @@ function saveUser(id, state) {
   fs.renameSync(tmp, file);
 }
 
-async function getEmbedding(text) {
-  const input = String(text || "").trim();
-  if (!input) return null;
-  if (!openai) return null;
-
-  try {
-    const resp = await openai.embeddings.create({
-      model: EMBED_MODEL,
-      input,
-    });
-    const emb = resp?.data?.[0]?.embedding;
-    return Array.isArray(emb) ? emb : null;
-  } catch {
-    return null;
-  }
-}
-
 async function ensureItemEmbedding(item) {
   if (Array.isArray(item.embedding) && item.embedding.length) return true;
   try {
@@ -635,38 +618,6 @@ async function ensureItemEmbedding(item) {
     return true;
   } catch {
     return false;
-  }
-}
-
-async function tagEmotion(text) {
-  const input = String(text || "").trim().slice(0, 800);
-  if (!input) return { emotion: "neutral", intensity: 1 };
-  if (!openai) return { emotion: "neutral", intensity: 1 };
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: EMOTION_TAGGER_PROMPT },
-        { role: "user", content: input },
-      ],
-      temperature: 0,
-      max_tokens: 60,
-    });
-
-    const raw = resp?.choices?.[0]?.message?.content || "";
-    let parsed = null;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      parsed = null;
-    }
-
-    const emotion = normalizeEmotion(parsed?.emotion);
-    const intensity = clampInt(parsed?.intensity ?? 1, 1, 3);
-    return { emotion, intensity };
-  } catch {
-    return { emotion: "neutral", intensity: 1 };
   }
 }
 
