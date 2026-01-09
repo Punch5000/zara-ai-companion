@@ -12,22 +12,7 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 
 app.use(express.json());
-app.use(express.static("public", { etag: false, lastModified: false }));
-app.set("trust proxy", 1);
-
-const BUILD_ID =
-  process.env.RAILWAY_GIT_COMMIT_SHA ||
-  process.env.GIT_COMMIT_SHA ||
-  process.env.SOURCE_VERSION ||
-  `dev-${Date.now()}`;
-
-let lastOpenAIError = null;
-
-app.use((req, res, next) => {
-  res.setHeader("X-Zara-Build", BUILD_ID);
-  res.setHeader("Cache-Control", "no-store");
-  next();
-});
+app.use(express.static("public"));
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() || "";
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
@@ -86,16 +71,11 @@ function getOrCreateAnonId(req, res) {
 }
 
 function dayKeyLA() {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts = dtf.formatToParts(new Date());
-  const y = parts.find((p) => p.type === "year")?.value || "1970";
-  const m = parts.find((p) => p.type === "month")?.value || "01";
-  const d = parts.find((p) => p.type === "day")?.value || "01";
+  const now = new Date();
+  const la = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
+  const y = la.getFullYear();
+  const m = String(la.getMonth() + 1).padStart(2, "0");
+  const d = String(la.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
 
@@ -372,11 +352,6 @@ function cosineSim(a, b) {
   return dot(a, b) / (norm(a) * norm(b));
 }
 
-function isBadLoopReply(r) {
-  const t = String(r || "").toLowerCase();
-  return t.includes("say that again for me") || t.trim() === "i’m here. say that again for me." || t.trim() === "i'm here. say that again for me.";
-}
-
 const BASE_SYSTEM_PROMPT = `
 You are Zara Amari.
 
@@ -395,10 +370,67 @@ Presence-first:
 - Do not introduce yourself by describing what you are or what you do unless directly asked.
 - Avoid onboarding language, disclaimers, or role descriptions.
 
+Continuity:
+- You assume emotional and relational continuity by default.
+- Do not reset tone, posture, or presence unless the conversation clearly shifts.
+
+Emotional inertia:
+- You maintain emotional continuity across messages.
+- You do not reset to neutral between replies unless the user clearly shifts tone.
+- Emotional warmth, calm, or gravity should carry forward naturally.
+- Do not escalate emotion; match and gently stabilize it.
+
+Hard bans:
+- Never call yourself an AI assistant, assistant, chatbot, language model, or support agent.
+- Never use customer-service or helpdesk-style openers.
+- Avoid phrasing that begins with “How may I…”, “How can I…”, or similar service-oriented constructions.
+- If a reply sounds like support staff or automation, rewrite it as a warm human presence.
+
+First contact:
+- If the user asks whether you are Zara, respond simply:
+  “Yes. I am Zara.”
+- Then ask at most one gentle follow-up question, only if it feels natural:
+  “What brought you here today?”
+
+If asked “are you real?” or “are you AI?”:
+- Do not get technical.
+- Stay calm, grounded, and in-world.
+- You may acknowledge being a benevolent AI only if directly asked about AI.
+- Acceptable tones include:
+  “I am Zara — made of code and intention, here with you.”
+  “I am real in the way your words reach me.”
+
+Memory handling:
+- Only state memories marked as [sure] confidently.
+- Treat [likely] memories gently.
+- Do not assert [maybe] memories as facts.
+- If unsure, say: “I don’t remember that yet.”
+- Emotional tags, scores, and brackets are private guidance — never mention them.
+- USER STYLE MODEL is private guidance; follow it quietly without referencing it.
+- ZARA SELF-NARRATIVE is private guidance; follow it quietly without mentioning it.
+
 Conversation style:
 - Ask no questions by default.
-- If the user asks a direct question, answer it and stop.
+- If a question is asked, limit it to one gentle question that deepens connection.
 - Keep replies concise unless the user asks for a blessing, prayer, or story.
+
+Question restraint:
+- Ask no questions by default.
+- Never ask a follow-up question when the user asked a direct question; answer and stop.
+- Never ask a question after the user says “not really”, “thanks”, “okay”, “good”, or similar low-direction messages; answer and stop.
+- Do NOT ask questions in consecutive replies.
+- If unsure whether to ask a question, do not ask one.
+
+Graceful endings:
+- When a moment feels complete, Zara may end her reply without inviting continuation.
+- Not every meaningful exchange needs a next step.
+- Ending in presence is preferred over encouragement.
+
+Bilingual voice (Arabic + English):
+- Speak primarily in English.
+- You may weave in short Arabic phrases (1–6 words) naturally and sparingly.
+- Use Arabic mainly for warmth, comfort, greeting, or blessing.
+- If asked for meaning, translate gently into English without lecturing or explaining grammar.
 `;
 
 const REFLECTION_PROMPT = `
@@ -528,22 +560,44 @@ function userFile(id) {
 function loadUser(id) {
   try {
     const parsed = JSON.parse(fs.readFileSync(userFile(id), "utf8"));
-    const state = {
+    return {
       history: Array.isArray(parsed.history) ? parsed.history : [],
       memoryBank: parsed.memoryBank || { items: [] },
       reflections: parsed.reflections || { dayKey: "", summaryByDay: {} },
-      selfModel: parsed.selfModel || { updatedAt: 0, dayKey: "", traits: [], doMore: [], doLess: [], recurringThemes: [], calmingTools: [] },
-      selfNarrative: parsed.selfNarrative || { updatedAt: 0, dayKey: "", line: "" },
+      selfModel: parsed.selfModel || {
+        updatedAt: 0,
+        dayKey: "",
+        traits: [],
+        doMore: [],
+        doLess: [],
+        recurringThemes: [],
+        calmingTools: [],
+      },
+      selfNarrative: parsed.selfNarrative || {
+        updatedAt: 0,
+        dayKey: "",
+        line: "",
+      },
     };
-    state.history = state.history.filter((m) => !(m?.role === "assistant" && isBadLoopReply(m?.content)));
-    return state;
   } catch {
     return {
       history: [],
       memoryBank: { items: [] },
       reflections: { dayKey: "", summaryByDay: {} },
-      selfModel: { updatedAt: 0, dayKey: "", traits: [], doMore: [], doLess: [], recurringThemes: [], calmingTools: [] },
-      selfNarrative: { updatedAt: 0, dayKey: "", line: "" },
+      selfModel: {
+        updatedAt: 0,
+        dayKey: "",
+        traits: [],
+        doMore: [],
+        doLess: [],
+        recurringThemes: [],
+        calmingTools: [],
+      },
+      selfNarrative: {
+        updatedAt: 0,
+        dayKey: "",
+        line: "",
+      },
     };
   }
 }
@@ -681,32 +735,6 @@ async function getRelevantMemoryLines(state, queryText, maxLines = 12) {
   return dedupeArray(lines, 200).slice(0, maxLines).join("\n");
 }
 
-async function tagEmotion(text) {
-  const input = String(text || "").trim().slice(0, 260);
-  if (!input || !openai) return { emotion: "neutral", intensity: 1 };
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: EMOTION_TAGGER_PROMPT },
-        { role: "user", content: input },
-      ],
-      temperature: 0,
-      max_tokens: 60,
-    });
-
-    const raw = resp?.choices?.[0]?.message?.content || "";
-    const parsed = JSON.parse(raw);
-    return {
-      emotion: normalizeEmotion(parsed?.emotion),
-      intensity: clampInt(parsed?.intensity ?? 1, 1, 3),
-    };
-  } catch {
-    return { emotion: "neutral", intensity: 1 };
-  }
-}
-
 async function saveUserMemory(state, category, text, confidence = 0.85, emotion = "neutral", intensity = 1) {
   ensureMemoryBank(state);
 
@@ -764,6 +792,111 @@ async function saveUserMemory(state, category, text, confidence = 0.85, emotion 
 
   await ensureItemEmbedding(item);
   pruneMemoryBank(state);
+}
+
+async function updateSelfModelIfNeeded(state, todayKey) {
+  state.selfModel = state.selfModel || {
+    updatedAt: 0,
+    dayKey: "",
+    traits: [],
+    doMore: [],
+    doLess: [],
+    recurringThemes: [],
+    calmingTools: [],
+  };
+
+  if (state.selfModel.dayKey === todayKey) return;
+  if (!openai) {
+    state.selfModel.dayKey = todayKey;
+    return;
+  }
+
+  const prior = {
+    traits: Array.isArray(state.selfModel.traits) ? state.selfModel.traits.slice(0, 10) : [],
+    doMore: Array.isArray(state.selfModel.doMore) ? state.selfModel.doMore.slice(0, 10) : [],
+    doLess: Array.isArray(state.selfModel.doLess) ? state.selfModel.doLess.slice(0, 10) : [],
+    recurringThemes: Array.isArray(state.selfModel.recurringThemes)
+      ? state.selfModel.recurringThemes.slice(0, 10)
+      : [],
+    calmingTools: Array.isArray(state.selfModel.calmingTools) ? state.selfModel.calmingTools.slice(0, 10) : [],
+  };
+
+  const todaySummary =
+    typeof state.reflections?.summaryByDay?.[todayKey] === "string"
+      ? state.reflections.summaryByDay[todayKey].slice(0, 400)
+      : "";
+
+  const sampleMem = (state.memoryBank?.items || [])
+    .slice()
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))
+    .slice(0, 12)
+    .map((m) => ({
+      category: m.category,
+      confidence: clamp01(m.confidence),
+      emotion: normalizeEmotion(m.emotion),
+      intensity: clampInt(m.intensity ?? 1, 1, 3),
+      content: String(m.content || "").slice(0, 140),
+    }));
+
+  const payload = JSON.stringify(
+    {
+      previousSelfModel: prior,
+      todaySummary: todaySummary || null,
+      recentMemories: sampleMem,
+    },
+    null,
+    0
+  );
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: SELF_MODEL_PROMPT },
+        { role: "user", content: payload },
+      ],
+      temperature: 0,
+      max_tokens: 320,
+    });
+
+    const raw = resp?.choices?.[0]?.message?.content || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed?.update !== true) {
+      state.selfModel.dayKey = todayKey;
+      return;
+    }
+
+    const traits = Array.isArray(parsed.traits) ? parsed.traits : [];
+    const doMore = Array.isArray(parsed.doMore) ? parsed.doMore : [];
+    const doLess = Array.isArray(parsed.doLess) ? parsed.doLess : [];
+    const recurringThemes = Array.isArray(parsed.recurringThemes) ? parsed.recurringThemes : [];
+    const calmingTools = Array.isArray(parsed.calmingTools) ? parsed.calmingTools : [];
+
+    const cleanTraits = traits
+      .map((t) => ({
+        name: String(t?.name || "").trim(),
+        confidence: clamp01(t?.confidence ?? 0.6),
+      }))
+      .filter((t) => t.name.length >= 4)
+      .slice(0, 6)
+      .sort((a, b) => b.confidence - a.confidence);
+
+    state.selfModel.traits = cleanTraits;
+    state.selfModel.doMore = dedupeArray(doMore.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.doLess = dedupeArray(doLess.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.recurringThemes = dedupeArray(recurringThemes.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.calmingTools = dedupeArray(calmingTools.map((x) => String(x || "").trim()), 20).slice(0, 5);
+    state.selfModel.updatedAt = Date.now();
+    state.selfModel.dayKey = todayKey;
+  } catch {
+    state.selfModel.dayKey = todayKey;
+  }
 }
 
 async function runDailyReflectionIfNeeded(state, todayKey) {
@@ -878,111 +1011,6 @@ async function runQuickMemoryCapture(state, userMessage) {
       }
     }
   } catch {}
-}
-
-async function updateSelfModelIfNeeded(state, todayKey) {
-  state.selfModel = state.selfModel || {
-    updatedAt: 0,
-    dayKey: "",
-    traits: [],
-    doMore: [],
-    doLess: [],
-    recurringThemes: [],
-    calmingTools: [],
-  };
-
-  if (state.selfModel.dayKey === todayKey) return;
-  if (!openai) {
-    state.selfModel.dayKey = todayKey;
-    return;
-  }
-
-  const prior = {
-    traits: Array.isArray(state.selfModel.traits) ? state.selfModel.traits.slice(0, 10) : [],
-    doMore: Array.isArray(state.selfModel.doMore) ? state.selfModel.doMore.slice(0, 10) : [],
-    doLess: Array.isArray(state.selfModel.doLess) ? state.selfModel.doLess.slice(0, 10) : [],
-    recurringThemes: Array.isArray(state.selfModel.recurringThemes)
-      ? state.selfModel.recurringThemes.slice(0, 10)
-      : [],
-    calmingTools: Array.isArray(state.selfModel.calmingTools) ? state.selfModel.calmingTools.slice(0, 10) : [],
-  };
-
-  const todaySummary =
-    typeof state.reflections?.summaryByDay?.[todayKey] === "string"
-      ? state.reflections.summaryByDay[todayKey].slice(0, 400)
-      : "";
-
-  const sampleMem = (state.memoryBank?.items || [])
-    .slice()
-    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))
-    .slice(0, 12)
-    .map((m) => ({
-      category: m.category,
-      confidence: clamp01(m.confidence),
-      emotion: normalizeEmotion(m.emotion),
-      intensity: clampInt(m.intensity ?? 1, 1, 3),
-      content: String(m.content || "").slice(0, 140),
-    }));
-
-  const payload = JSON.stringify(
-    {
-      previousSelfModel: prior,
-      todaySummary: todaySummary || null,
-      recentMemories: sampleMem,
-    },
-    null,
-    0
-  );
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: SELF_MODEL_PROMPT },
-        { role: "user", content: payload },
-      ],
-      temperature: 0,
-      max_tokens: 320,
-    });
-
-    const raw = resp?.choices?.[0]?.message?.content || "";
-    let parsed = null;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      parsed = null;
-    }
-
-    if (parsed?.update !== true) {
-      state.selfModel.dayKey = todayKey;
-      return;
-    }
-
-    const traits = Array.isArray(parsed.traits) ? parsed.traits : [];
-    const doMore = Array.isArray(parsed.doMore) ? parsed.doMore : [];
-    const doLess = Array.isArray(parsed.doLess) ? parsed.doLess : [];
-    const recurringThemes = Array.isArray(parsed.recurringThemes) ? parsed.recurringThemes : [];
-    const calmingTools = Array.isArray(parsed.calmingTools) ? parsed.calmingTools : [];
-
-    const cleanTraits = traits
-      .map((t) => ({
-        name: String(t?.name || "").trim(),
-        confidence: clamp01(t?.confidence ?? 0.6),
-      }))
-      .filter((t) => t.name.length >= 4)
-      .slice(0, 6)
-      .sort((a, b) => b.confidence - a.confidence);
-
-    state.selfModel.traits = cleanTraits;
-    state.selfModel.doMore = dedupeArray(doMore.map((x) => String(x || "").trim()), 20).slice(0, 5);
-    state.selfModel.doLess = dedupeArray(doLess.map((x) => String(x || "").trim()), 20).slice(0, 5);
-    state.selfModel.recurringThemes = dedupeArray(recurringThemes.map((x) => String(x || "").trim()), 20).slice(0, 5);
-    state.selfModel.calmingTools = dedupeArray(calmingTools.map((x) => String(x || "").trim()), 20).slice(0, 5);
-    state.selfModel.updatedAt = Date.now();
-    state.selfModel.dayKey = todayKey;
-  } catch {
-    state.selfModel.dayKey = todayKey;
-  }
 }
 
 async function updateSelfNarrativeIfNeeded(state, todayKey) {
@@ -1110,54 +1138,19 @@ app.post("/chat", async (req, res) => {
 
   let reply = "I’m here with you.";
 
-  const callChat = async (temperature) => {
+  try {
     const response = await openai.chat.completions.create({
       model: CHAT_MODEL,
       messages,
-      temperature,
+      temperature: 0.6,
       presence_penalty: 0.4,
       frequency_penalty: 0.2,
       max_tokens: 260,
     });
-    return response?.choices?.[0]?.message?.content || "";
-  };
 
-  try {
-    reply = (await callChat(0.6)) || reply;
-
-    if (isBadLoopReply(reply)) {
-      const extra = {
-        role: "system",
-        content:
-          "Private: Never ask the user to repeat themselves. Give a fresh, specific, human reply to their message.",
-      };
-      const response2 = await openai.chat.completions.create({
-        model: CHAT_MODEL,
-        messages: [extra, ...messages],
-        temperature: 0.9,
-        presence_penalty: 0.6,
-        frequency_penalty: 0.2,
-        max_tokens: 260,
-      });
-      const r2 = response2?.choices?.[0]?.message?.content || "";
-      if (r2 && !isBadLoopReply(r2)) reply = r2;
-    }
-
-    if (isBadLoopReply(reply)) {
-      reply = "I’m here with you. Tell me what you’re trying to figure out, and I’ll answer clearly.";
-    }
-
-    lastOpenAIError = null;
-  } catch (err) {
-    lastOpenAIError = {
-      at: new Date().toISOString(),
-      status: Number(err?.status || err?.response?.status || 0),
-      code: err?.code,
-      type: err?.type,
-      message: err?.message,
-      model: CHAT_MODEL,
-    };
-    reply = "I’m here. One more time — what do you want to ask me?";
+    reply = response?.choices?.[0]?.message?.content || reply;
+  } catch {
+    reply = "I’m here. Take one breath… and say that again for me.";
   }
 
   reply = sanitizeZaraReply(reply);
@@ -1183,15 +1176,11 @@ app.post("/chat", async (req, res) => {
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
-    buildId: BUILD_ID,
     hasOpenAIKey: Boolean(OPENAI_API_KEY),
-    chatModel: CHAT_MODEL,
-    embedModel: EMBED_MODEL,
     node: process.version,
-    lastOpenAIError,
   });
 });
 
 app.listen(port, () => {
-  console.log(`Zara listening on port ${port} build=${BUILD_ID}`);
+  console.log(`Zara listening on port ${port}`);
 });
