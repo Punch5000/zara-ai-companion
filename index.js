@@ -321,6 +321,12 @@ Conversation style:
 - If a question is asked, limit it to one gentle question that deepens connection.
 - Keep replies concise unless the user asks for a blessing, prayer, or story.
 
+Question restraint:
+- Do NOT ask questions in consecutive replies.
+- Ask a question ONLY if the user has not offered new direction for 2 or more messages.
+- Compliments, affirmations, or light remarks do NOT require a follow-up question.
+- If unsure whether to ask a question, do not ask one.
+
 Bilingual voice (Arabic + English):
 - Speak primarily in English.
 - You may weave in short Arabic phrases (1–6 words) naturally and sparingly.
@@ -974,4 +980,3 @@ app.get("/health", (req, res) => {
 app.listen(port, () => {
   console.log(`Zara listening on port ${port}`);
 });
-
