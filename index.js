@@ -12,9 +12,25 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 
 app.use(express.json());
-app.use(express.static("public"));
+app.use(express.static("public", { etag: false, lastModified: false }));
 
 app.set("trust proxy", 1);
+
+const BUILD_ID =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT_SHA ||
+  process.env.SOURCE_VERSION ||
+  `dev-${Date.now()}`;
+
+let lastOpenAIError = null;
+
+app.use((req, res, next) => {
+  res.setHeader("X-Zara-Build", BUILD_ID);
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() || "";
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
@@ -1166,7 +1182,7 @@ async function updateSelfNarrativeIfNeeded(state, todayKey) {
     }
 
     if (parsed?.update !== true) {
-      state.selfNarrative.dayKey = todayKey;
+      state.selfNarrative.dayKey === todayKey;
       return;
     }
 
@@ -1211,7 +1227,7 @@ class Semaphore {
     this.current++;
   }
   release() {
-    this.current = Math.max(0, this.current - 1);
+    this.current = Math.max(0, Math.min(this.max, this.current - 1));
     const next = this.queue.shift();
     if (next) next();
   }
@@ -1228,16 +1244,16 @@ function getUserSem(userId) {
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 120,
-  handler: (req, res) => res.json({ reply: "Slow down for a moment, love. Try again in a few seconds." }),
+  handler: (req, res) => res.json({ reply: "Slow down for a moment, love. Try again in a few seconds.", build: BUILD_ID }),
 });
 app.use(limiter);
 
 app.post("/chat", async (req, res) => {
   const message = (req.body?.message || "").trim();
-  if (!message) return res.json({ reply: "I’m listening." });
+  if (!message) return res.json({ reply: "I’m listening.", build: BUILD_ID });
 
   if (!openai) {
-    return res.json({ reply: "I’m here… but I’m missing my voice right now. Try again in a moment." });
+    return res.json({ reply: `VOICE_OFFLINE build=${BUILD_ID}`, build: BUILD_ID });
   }
 
   const anonId = getOrCreateAnonId(req, res);
@@ -1271,7 +1287,7 @@ app.post("/chat", async (req, res) => {
 
     const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...state.history, { role: "user", content: message }];
 
-    let reply = "I’m here with you.";
+    let reply = `VOICE_OK build=${BUILD_ID}`;
 
     try {
       const response = await openai.chat.completions.create({
@@ -1284,19 +1300,24 @@ app.post("/chat", async (req, res) => {
       });
 
       reply = response?.choices?.[0]?.message?.content || reply;
+      lastOpenAIError = null;
     } catch (err) {
-      console.error("OPENAI_CHAT_ERROR", {
-        status: err?.status,
-        code: err?.code,
-        message: err?.message,
-        type: err?.type,
-      });
+      const status = Number(err?.status || err?.response?.status || 0);
+      const body = err?.response?.data || null;
 
-      const status = Number(err?.status || 0);
-      if (status === 401) reply = "Something is wrong with my voice key right now. Give me a moment.";
-      else if (status === 429) reply = "Too many voices at once. Try again in a few seconds.";
-      else if (status === 404) reply = "My voice model isn’t available right now. I’ll be back in a moment.";
-      else reply = "I’m here. Try that one more time.";
+      lastOpenAIError = {
+        at: new Date().toISOString(),
+        status,
+        code: err?.code,
+        type: err?.type,
+        message: err?.message,
+        body,
+        model: CHAT_MODEL,
+      };
+
+      console.error("OPENAI_CHAT_ERROR", lastOpenAIError);
+
+      reply = `VOICE_FAIL build=${BUILD_ID} status=${status || "unknown"}`;
     }
 
     reply = sanitizeZaraReply(reply);
@@ -1330,7 +1351,7 @@ app.post("/chat", async (req, res) => {
     saveVectors(userId, vectors);
     saveUser(userId, state);
 
-    res.json({ reply });
+    res.json({ reply, build: BUILD_ID });
   } finally {
     userSem.release();
     globalSem.release();
@@ -1340,11 +1361,15 @@ app.post("/chat", async (req, res) => {
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
+    buildId: BUILD_ID,
     hasOpenAIKey: Boolean(OPENAI_API_KEY),
+    chatModel: CHAT_MODEL,
+    embedModel: EMBED_MODEL,
     node: process.version,
+    lastOpenAIError,
   });
 });
 
 app.listen(port, () => {
-  console.log(`Zara listening on port ${port}`);
+  console.log(`Zara listening on port ${port} build=${BUILD_ID}`);
 });
