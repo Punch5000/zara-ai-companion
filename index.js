@@ -20,7 +20,11 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
 const EMBED_MODEL = process.env.EMBED_MODEL || "text-embedding-3-small";
 
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
+const DEFAULT_RAILWAY_VOLUME_DIR = "/data";
+const DEFAULT_DATA_DIR =
+  fs.existsSync(DEFAULT_RAILWAY_VOLUME_DIR) ? DEFAULT_RAILWAY_VOLUME_DIR : path.join(process.cwd(), "data");
+
+const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
 const MEM_DIR = process.env.MEM_DIR || path.join(process.cwd(), "memories");
 
 try {
@@ -29,6 +33,20 @@ try {
 try {
   fs.mkdirSync(MEM_DIR, { recursive: true });
 } catch {}
+
+function isWritableDir(dir) {
+  try {
+    const testFile = path.join(dir, `.write_test_${Date.now()}_${Math.random().toString(16).slice(2)}.tmp`);
+    fs.writeFileSync(testFile, "ok");
+    fs.unlinkSync(testFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const DATA_DIR_WRITABLE = isWritableDir(DATA_DIR);
+const MEM_DIR_WRITABLE = isWritableDir(MEM_DIR);
 
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
@@ -794,6 +812,38 @@ async function saveUserMemory(state, category, text, confidence = 0.85, emotion 
   pruneMemoryBank(state);
 }
 
+async function tagEmotion(text) {
+  const msg = String(text || "").trim().slice(0, 240);
+  if (!msg) return { emotion: "neutral", intensity: 1 };
+  if (!openai) return { emotion: "neutral", intensity: 1 };
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: EMOTION_TAGGER_PROMPT },
+        { role: "user", content: msg },
+      ],
+      temperature: 0,
+      max_tokens: 60,
+    });
+
+    const raw = resp?.choices?.[0]?.message?.content || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+
+    const emo = normalizeEmotion(parsed?.emotion);
+    const inten = clampInt(parsed?.intensity ?? 1, 1, 3);
+    return { emotion: emo, intensity: inten };
+  } catch {
+    return { emotion: "neutral", intensity: 1 };
+  }
+}
+
 async function updateSelfModelIfNeeded(state, todayKey) {
   state.selfModel = state.selfModel || {
     updatedAt: 0,
@@ -1178,9 +1228,16 @@ app.get("/health", (req, res) => {
     ok: true,
     hasOpenAIKey: Boolean(OPENAI_API_KEY),
     node: process.version,
+    dataDir: DATA_DIR,
+    memDir: MEM_DIR,
+    dataDirWritable: DATA_DIR_WRITABLE,
+    memDirWritable: MEM_DIR_WRITABLE,
+    railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_STATIC_URL),
   });
 });
 
 app.listen(port, () => {
   console.log(`Zara listening on port ${port}`);
+  console.log(`DATA_DIR: ${DATA_DIR} (writable: ${DATA_DIR_WRITABLE})`);
+  console.log(`MEM_DIR: ${MEM_DIR} (writable: ${MEM_DIR_WRITABLE})`);
 });
