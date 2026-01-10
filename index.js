@@ -235,8 +235,37 @@ function loadAllMemories(maxChars = 8000) {
   }
 }
 
+function looksLikeQuestionSentence(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+
+  if (t.includes("?")) return true;
+
+  if (/^(who|what|when|where|why|how|can|could|would|should|do|did|does|is|are|am|will)\b/i.test(t)) return true;
+
+  if (
+    /(what would you like|would you like|what do you want|what’s on your mind|what is on your mind|what brought you here|tell me)\b/i.test(
+      t
+    )
+  )
+    return true;
+
+  if (/\b(you want to|you wanna|do you|can you|could you|would you|should you)\b/i.test(t)) return true;
+
+  return false;
+}
+
 function hasQuestion(text) {
-  return /\?/.test(String(text || ""));
+  const s = String(text || "");
+  if (!s.trim()) return false;
+
+  const parts = s
+    .split(/\n+/)
+    .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  return parts.some((p) => looksLikeQuestionSentence(p));
 }
 
 function isLowDirectionUserMessage(text) {
@@ -311,13 +340,36 @@ function shouldAllowZaraQuestion(state, userText) {
 }
 
 function removeQuestions(text) {
-  let out = String(text || "").trim();
-  out = out.replace(/[^.!?\n]*\?[^.!?\n]*(?:[.!?\n]|$)/g, (m) => {
-    const s = m.replace(/\?/g, ".").trim();
-    return s ? s + " " : "";
-  });
-  out = out.replace(/\?/g, ".");
-  out = out.replace(/\s{2,}/g, " ").trim();
+  const original = String(text || "").trim();
+  if (!original) return "";
+
+  const lines = original.split("\n");
+  const keptLines = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      keptLines.push("");
+      continue;
+    }
+
+    const sentences = trimmed
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const keptSentences = [];
+    for (const s of sentences) {
+      if (looksLikeQuestionSentence(s)) continue;
+      keptSentences.push(s);
+    }
+
+    const rebuilt = keptSentences.join(" ").replace(/\s{2,}/g, " ").trim();
+    if (rebuilt) keptLines.push(rebuilt);
+  }
+
+  let out = keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!out) out = "I’m here with you.";
   return out;
 }
 
